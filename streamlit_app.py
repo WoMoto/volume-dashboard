@@ -1,18 +1,18 @@
 """
-streamlit_app.py - 거래량 대시보드 v5
-v4에서 추가:
-- 비밀번호 잠금 (DASHBOARD_PASSWORD)
-- 통합 관리대장 쓰기 (서비스 계정 인증)
-  - 신규 멤버 추가
-  - 실제 입장확인 일괄 처리
-- 시트 읽기를 gspread로 통일 (시트 비공개 가능)
+streamlit_app.py - 거래량 대시보드 v6
+v5에서 추가/변경:
+- '제외' 구분값 신설 + H열에 '제외일' 컬럼 추가 (메모는 I열로 이동)
+- 신규 멤버 추가: 구분에 따라 D/F/H 날짜 자동 채움 (오늘 기준, KST)
+- 통합대장 편집 섹션 신설: 조회 결과에서 UID 다중 선택 → 트뷰 닉네임/구분/입장시드
+  일괄 수정. 구분이 바뀌면서 D/F/H가 비어있으면 오늘 날짜 자동 반영.
+- 이미 값이 있는 D/F/H는 절대 덮어쓰지 않음 (히스토리 보존).
 """
 
 import json
 import hmac
 import hashlib
 import base64
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 import pandas as pd
@@ -29,25 +29,33 @@ OKX_API_BASE = "https://www.okx.com"
 SHEET_ID = "1kahCWtaZ35pbCa7XMBcrPNEXsGTQ28XTCTYA8qmL-uY"
 SHEET_TAB = "통합 관리대장"
 
-# 시트 컬럼 (1-based)
-COL_UID = 1
-COL_NICK = 2
-COL_GUBUN = 3
-COL_ROOM_DATE = 4
-COL_SEED = 5
-COL_IND_DATE = 6
-COL_CONFIRMED = 7
-COL_MEMO = 8
+# 시트 컬럼 (1-based, A=1)
+COL_UID = 1        # A
+COL_NICK = 2       # B
+COL_GUBUN = 3      # C
+COL_ROOM_DATE = 4  # D
+COL_SEED = 5       # E
+COL_IND_DATE = 6   # F
+COL_CONFIRMED = 7  # G
+COL_EXCLUDED = 8   # H (신규)
+COL_MEMO = 9       # I (변경)
 
 LEDGER_COLS = [
     "트뷰 닉네임", "구분", "트레이딩룸 입장일", "입장시드",
-    "지표 지급날짜", "실제 입장확인", "메모",
+    "지표 지급날짜", "실제 입장확인", "제외일", "메모",
 ]
-GUBUN_OPTIONS = ["트레이딩룸+지표", "트레이딩룸만", "지표만"]
+GUBUN_OPTIONS = ["트레이딩룸+지표", "트레이딩룸만", "지표만", "제외"]
+
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
+KST = timezone(timedelta(hours=9))
+
+
+def _today_str():
+    now = datetime.now(KST)
+    return f"{now.year}. {now.month}. {now.day}"
 
 
 # ═══════════════════════════════════════════
@@ -168,39 +176,85 @@ def get_worksheet():
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_ledger():
+    """헤더 뒤에 빈 칸이 있어도 문제없이 읽도록 get_all_values 기반."""
     try:
         ws = get_worksheet()
-        records = ws.get_all_records()
+        all_values = ws.get_all_values()
+        if not all_values:
+            return {}, "시트가 비어있어요."
+        header = [h.strip() for h in all_values[0]]
+        if "UID" not in header:
+            return {}, f"시트에 UID 칸이 없어요. (찾은 칸: {header})"
+        uid_idx = header.index("UID")
+        col_indexes = {c: header.index(c) for c in LEDGER_COLS if c in header}
+
         ledger = {}
-        for r in records:
-            uid = str(r.get("UID", "")).strip()
-            if uid:
-                ledger[uid] = {c: str(r.get(c, "")).strip() for c in LEDGER_COLS}
+        for row in all_values[1:]:
+            if uid_idx >= len(row):
+                continue
+            uid = str(row[uid_idx]).strip()
+            if not uid:
+                continue
+            ledger[uid] = {
+                col: str(row[idx]).strip() if idx < len(row) else ""
+                for col, idx in col_indexes.items()
+            }
         return ledger, None
     except Exception as e:
         return {}, f"통합대장 불러오기 실패: {e}"
 
 
-def append_member(ws, uid, nickname, gubun, room_date, seed, ind_date, memo):
-    new_row = [uid, nickname, gubun, room_date, seed, ind_date, "", memo]
+def append_member(ws, uid, nickname, gubun, seed, memo):
+    """새 멤버 추가. 구분에 따라 D/F/H 자동 채움."""
+    today = _today_str()
+    room_date = today if "트레이딩룸" in gubun else ""
+    ind_date = today if "지표" in gubun else ""
+    excl_date = today if gubun == "제외" else ""
+    # A=UID, B=닉, C=구분, D=입장일, E=시드, F=지표일, G="", H=제외일, I=메모
+    new_row = [uid, nickname, gubun, room_date, seed, ind_date, "", excl_date, memo]
     ws.append_row(new_row, value_input_option="USER_ENTERED")
 
 
-def mark_confirmed_batch(ws, uids):
-    """선택된 UID들에 일괄로 '확인' 표시. (한 번의 API 호출)"""
+def build_uid_row_map(ws):
+    """UID → 시트 행 번호 매핑."""
     col_values = ws.col_values(COL_UID)
-    uid_to_row = {
+    return {
         str(v).strip(): i for i, v in enumerate(col_values, start=1)
         if str(v).strip()
     }
+
+
+def apply_edits_batch(ws, edits):
+    """
+    edits: [{"uid": ..., "col_updates": [(col_idx, new_val), ...]}]
+    한 번의 batch_update로 시트 반영.
+    """
+    uid_to_row = build_uid_row_map(ws)
+    batch = []
+    unfound = []
+    for edit in edits:
+        row = uid_to_row.get(str(edit["uid"]))
+        if row is None:
+            unfound.append(edit["uid"])
+            continue
+        for col_idx, val in edit["col_updates"]:
+            cell = gspread.utils.rowcol_to_a1(row, col_idx)
+            batch.append({"range": cell, "values": [[val]]})
+    if batch:
+        ws.batch_update(batch)
+    return len(batch), unfound
+
+
+def mark_confirmed_batch(ws, uids):
+    uid_to_row = build_uid_row_map(ws)
     success, fail, updates = [], [], []
     for uid in uids:
         row = uid_to_row.get(str(uid))
         if row is None:
             fail.append(uid)
             continue
-        cell_addr = gspread.utils.rowcol_to_a1(row, COL_CONFIRMED)
-        updates.append({"range": cell_addr, "values": [["확인"]]})
+        cell = gspread.utils.rowcol_to_a1(row, COL_CONFIRMED)
+        updates.append({"range": cell, "values": [["확인"]]})
         success.append(uid)
     if updates:
         ws.batch_update(updates)
@@ -239,17 +293,12 @@ with col_btn:
 # ─── 신규 멤버 추가 ───
 with st.expander("➕ 신규 멤버 추가하기"):
     with st.form("add_member_form", clear_on_submit=True):
-        st.caption("새 회원을 통합 관리대장에 등록합니다. *표시는 필수.")
+        st.caption("트뷰 닉네임·구분·입장시드만 입력하면 D/F/H 날짜는 오늘 기준으로 자동 채워집니다.")
         nm_uid = st.text_input("UID *")
-        nm_nick = st.text_input("트뷰 닉네임")
+        nm_nick = st.text_input("트뷰 닉네임 *")
         nm_gubun = st.selectbox("구분 *", GUBUN_OPTIONS)
-        c1, c2 = st.columns(2)
-        with c1:
-            nm_room_date = st.text_input("트레이딩룸 입장일 (예: 2026. 6. 25)")
-            nm_seed = st.text_input("입장시드")
-        with c2:
-            nm_ind_date = st.text_input("지표 지급날짜 (예: 2026. 6. 25)")
-            nm_memo = st.text_input("메모")
+        nm_seed = st.text_input("입장시드 (트레이딩룸 입장 시에만 채우세요)")
+        nm_memo = st.text_input("메모")
         submitted = st.form_submit_button("✅ 통합대장에 추가", type="primary")
 
     if submitted:
@@ -265,11 +314,8 @@ with st.expander("➕ 신규 멤버 추가하기"):
         else:
             try:
                 ws = get_worksheet()
-                append_member(
-                    ws, uid_clean, nm_nick.strip(), nm_gubun,
-                    nm_room_date.strip(), nm_seed.strip(),
-                    nm_ind_date.strip(), nm_memo.strip(),
-                )
+                append_member(ws, uid_clean, nm_nick.strip(), nm_gubun,
+                              nm_seed.strip(), nm_memo.strip())
                 load_ledger.clear()
                 st.success(f"✅ {uid_clean} 추가 완료! (구분: {nm_gubun})")
             except Exception as e:
@@ -318,6 +364,7 @@ if st.button("조회", type="primary"):
                 "입장시드": lg.get("입장시드") or "-",
                 "지표 지급날짜": lg.get("지표 지급날짜") or "-",
                 "실제 입장확인": lg.get("실제 입장확인") or "-",
+                "제외일": lg.get("제외일") or "-",
                 "메모": lg.get("메모") or "-",
             })
             results.append(row)
@@ -364,7 +411,114 @@ if st.session_state.get("last_results"):
     st.download_button("결과 CSV 다운로드", data=csv,
                        file_name="volume_status.csv", mime="text/csv")
 
-    # ─── 실제 입장확인 일괄 처리 ───
+    # ═══════════════════════════════════════════
+    # 통합대장 편집
+    # ═══════════════════════════════════════════
+    st.divider()
+    st.subheader("✏️ 통합대장 편집")
+
+    editable_uids = [r["UID"] for r in results if r["구분"] != "-"]
+
+    if not editable_uids:
+        st.info("이번 조회 결과 중 통합대장에 있는 UID가 없어요. 신규 멤버는 위 '➕ 신규 멤버 추가하기'로 등록해주세요.")
+    else:
+        selected_edit = st.multiselect(
+            "편집할 UID 선택 (조회한 목록 중 대장에 있는 것만)",
+            options=editable_uids, key="edit_select",
+        )
+
+        if selected_edit:
+            edit_rows = []
+            for uid in selected_edit:
+                lg = ledger.get(uid, {})
+                edit_rows.append({
+                    "UID": uid,
+                    "트뷰 닉네임": lg.get("트뷰 닉네임", ""),
+                    "구분": lg.get("구분", ""),
+                    "입장시드": lg.get("입장시드", ""),
+                })
+            edit_df_before = pd.DataFrame(edit_rows)
+
+            # 선택 UID 조합이 바뀌면 에디터 리셋
+            sel_hash = hashlib.md5(
+                "_".join(sorted(selected_edit)).encode()
+            ).hexdigest()[:8]
+
+            edited = st.data_editor(
+                edit_df_before,
+                column_config={
+                    "UID": st.column_config.TextColumn(disabled=True),
+                    "구분": st.column_config.SelectboxColumn(
+                        options=GUBUN_OPTIONS, required=True
+                    ),
+                },
+                hide_index=True,
+                use_container_width=True,
+                key=f"edit_table_{sel_hash}",
+            )
+
+            st.caption(
+                "💡 구분을 바꾸면 관련 날짜(D/F/H)가 **비어있을 때만** 오늘 날짜로 자동 반영됩니다. "
+                "이미 값이 있으면 그대로 유지."
+            )
+
+            if st.button("💾 변경사항 시트에 저장", type="primary"):
+                today = _today_str()
+                edits = []
+                changed_uids = []
+
+                for i in range(len(edited)):
+                    uid = str(edited.iloc[i]["UID"])
+                    lg = ledger.get(uid, {})
+                    col_updates = []
+
+                    orig_nick = str(edit_df_before.iloc[i]["트뷰 닉네임"]).strip()
+                    new_nick = str(edited.iloc[i]["트뷰 닉네임"]).strip()
+                    if new_nick != orig_nick:
+                        col_updates.append((COL_NICK, new_nick))
+
+                    orig_seed = str(edit_df_before.iloc[i]["입장시드"]).strip()
+                    new_seed = str(edited.iloc[i]["입장시드"]).strip()
+                    if new_seed != orig_seed:
+                        col_updates.append((COL_SEED, new_seed))
+
+                    orig_gubun = str(edit_df_before.iloc[i]["구분"]).strip()
+                    new_gubun = str(edited.iloc[i]["구분"]).strip()
+                    if new_gubun != orig_gubun:
+                        col_updates.append((COL_GUBUN, new_gubun))
+                        # 날짜 자동 반영 (비어있는 경우에만)
+                        if "트레이딩룸" in new_gubun and not lg.get("트레이딩룸 입장일", "").strip():
+                            col_updates.append((COL_ROOM_DATE, today))
+                        if "지표" in new_gubun and not lg.get("지표 지급날짜", "").strip():
+                            col_updates.append((COL_IND_DATE, today))
+                        if new_gubun == "제외" and not lg.get("제외일", "").strip():
+                            col_updates.append((COL_EXCLUDED, today))
+
+                    if col_updates:
+                        edits.append({"uid": uid, "col_updates": col_updates})
+                        changed_uids.append(uid)
+
+                if not edits:
+                    st.info("변경사항이 없어요.")
+                else:
+                    try:
+                        ws = get_worksheet()
+                        cells_updated, unfound = apply_edits_batch(ws, edits)
+                        load_ledger.clear()
+                        st.success(
+                            f"✅ {len(changed_uids)}명 정보 업데이트 완료 "
+                            f"(총 {cells_updated}칸 변경)"
+                        )
+                        if unfound:
+                            st.warning(f"시트에 없는 UID: {', '.join(set(unfound))}")
+                        st.session_state.pop("last_results", None)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"저장 실패: {e}")
+
+    # ═══════════════════════════════════════════
+    # 실제 입장확인 일괄 처리
+    # ═══════════════════════════════════════════
     st.divider()
     st.subheader("✅ 실제 입장확인 처리")
     unconfirmed = [
