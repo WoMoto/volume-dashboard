@@ -145,6 +145,28 @@ def _check_uid(uid, account):
         return {"code": "error", "msg": f"응답 파싱 실패: {e}"}
 
 
+def call_invitee_list(account, limit=5):
+    """[임시] OKX invitee/list 엔드포인트 응답 확인용."""
+    from urllib.parse import urlencode
+    timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+    query = urlencode({"limit": str(limit)})
+    path = f"/api/v5/affiliate/invitee/list?{query}"
+    sig = _signature(timestamp, "GET", path, account["secret_key"])
+    headers = {
+        "OK-ACCESS-KEY": account["api_key"],
+        "OK-ACCESS-SIGN": sig,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": account["passphrase"],
+    }
+    try:
+        res = requests.get(OKX_API_BASE + path, headers=headers, timeout=15)
+        return {"http_status": res.status_code, "response": res.json()}
+    except requests.exceptions.Timeout:
+        return {"error": "timeout"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def _safe_float(value, default=0.0):
     try:
         return float(value) if value else default
@@ -384,6 +406,20 @@ with col_btn:
     if st.button("🔄 대장 새로고침"):
         load_ledger.clear()
         st.rerun()
+
+# ─── [임시] OKX invitee/list API 응답 확인 ───
+with st.expander("🧪 [임시] OKX invitee/list API 응답 확인"):
+    st.caption(
+        "OKX 어필리에이트 회원 목록 엔드포인트를 실제로 호출해서 응답 필드 확인용. "
+        "최근 30일 거래량 같은 필드가 나오는지 검증 후 이 섹션은 지울 예정."
+    )
+    test_limit = st.number_input("응답 개수 (몇 명 뽑을지)", min_value=1, max_value=20, value=3)
+    if st.button("🧪 호출 테스트"):
+        for acc in accounts:
+            st.markdown(f"**계정 {acc['name']} (어필리에이트 코드: `{acc['affiliate_code']}`)**")
+            with st.spinner("호출 중..."):
+                result = call_invitee_list(acc, limit=int(test_limit))
+            st.json(result)
 
 # ─── 신규 멤버 추가 / 업그레이드 ───
 with st.expander("➕ 신규 멤버 추가하기 / 기존 멤버 업그레이드"):
