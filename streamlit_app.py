@@ -51,6 +51,10 @@ SCOPES = [
 ]
 KST = timezone(timedelta(hours=9))
 
+# 우리 소속으로 인정할 어필리에이트 코드 목록
+# (K2110 같은 하위 인플루언서 코드는 여기 넣지 않음)
+OUR_AFFILIATE_CODES = {"41888826", "BULDAN", "DANTARANG"}
+
 
 def _today_str():
     now = datetime.now(KST)
@@ -102,7 +106,6 @@ def load_accounts():
         accounts.append({
             "name": "계정A", "api_key": a["api_key"],
             "secret_key": a["secret_key"], "passphrase": a["passphrase"],
-            "affiliate_code": "41888826",
         })
     except Exception:
         pass
@@ -111,7 +114,6 @@ def load_accounts():
         accounts.append({
             "name": "계정B", "api_key": b["api_key"],
             "secret_key": b["secret_key"], "passphrase": b["passphrase"],
-            "affiliate_code": "BULDAN",
         })
     except Exception:
         pass
@@ -145,28 +147,6 @@ def _check_uid(uid, account):
         return {"code": "error", "msg": f"응답 파싱 실패: {e}"}
 
 
-def call_invitee_list(account, limit=5):
-    """[임시] OKX invitee/list 엔드포인트 응답 확인용."""
-    from urllib.parse import urlencode
-    timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
-    query = urlencode({"limit": str(limit)})
-    path = f"/api/v5/affiliate/invitee/list?{query}"
-    sig = _signature(timestamp, "GET", path, account["secret_key"])
-    headers = {
-        "OK-ACCESS-KEY": account["api_key"],
-        "OK-ACCESS-SIGN": sig,
-        "OK-ACCESS-TIMESTAMP": timestamp,
-        "OK-ACCESS-PASSPHRASE": account["passphrase"],
-    }
-    try:
-        res = requests.get(OKX_API_BASE + path, headers=headers, timeout=15)
-        return {"http_status": res.status_code, "response": res.json()}
-    except requests.exceptions.Timeout:
-        return {"error": "timeout"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
 def _safe_float(value, default=0.0):
     try:
         return float(value) if value else default
@@ -184,7 +164,8 @@ def lookup_member(uid, accounts):
         result = _check_uid(uid, account)
         if result.get("code") == "0" and result.get("data"):
             data = result["data"][0]
-            if data.get("affiliateCode") == account["affiliate_code"]:
+            aff_code = data.get("affiliateCode", "")
+            if aff_code in OUR_AFFILIATE_CODES:
                 return {
                     "found": True, "error": None,
                     "month_volume": _safe_float(data.get("volMonth")),
@@ -192,6 +173,7 @@ def lookup_member(uid, accounts):
                     "total_commission": _safe_float(data.get("totalCommission")),
                     "deposit": _safe_float(data.get("depAmt")),
                     "account": account["name"],
+                    "affiliate_code": aff_code,
                 }
     return {"found": False, "error": "가입자 아님"}
 
@@ -406,20 +388,6 @@ with col_btn:
     if st.button("🔄 대장 새로고침"):
         load_ledger.clear()
         st.rerun()
-
-# ─── [임시] OKX invitee/list API 응답 확인 ───
-with st.expander("🧪 [임시] OKX invitee/list API 응답 확인"):
-    st.caption(
-        "OKX 어필리에이트 회원 목록 엔드포인트를 실제로 호출해서 응답 필드 확인용. "
-        "최근 30일 거래량 같은 필드가 나오는지 검증 후 이 섹션은 지울 예정."
-    )
-    test_limit = st.number_input("응답 개수 (몇 명 뽑을지)", min_value=1, max_value=20, value=3)
-    if st.button("🧪 호출 테스트"):
-        for acc in accounts:
-            st.markdown(f"**계정 {acc['name']} (어필리에이트 코드: `{acc['affiliate_code']}`)**")
-            with st.spinner("호출 중..."):
-                result = call_invitee_list(acc, limit=int(test_limit))
-            st.json(result)
 
 # ─── 신규 멤버 추가 / 업그레이드 ───
 with st.expander("➕ 신규 멤버 추가하기 / 기존 멤버 업그레이드"):
