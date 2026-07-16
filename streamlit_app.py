@@ -147,6 +147,28 @@ def _check_uid(uid, account):
         return {"code": "error", "msg": f"응답 파싱 실패: {e}"}
 
 
+def call_invitee_list_v2(account, limit=3):
+    """[임시] OKX 기술팀이 언급한 새 엔드포인트 응답 확인용."""
+    from urllib.parse import urlencode
+    timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+    query = urlencode({"limit": str(limit)})
+    path = f"/api/v5/affiliate/invitee/invitee-list?{query}"
+    sig = _signature(timestamp, "GET", path, account["secret_key"])
+    headers = {
+        "OK-ACCESS-KEY": account["api_key"],
+        "OK-ACCESS-SIGN": sig,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": account["passphrase"],
+    }
+    try:
+        res = requests.get(OKX_API_BASE + path, headers=headers, timeout=15)
+        return {"http_status": res.status_code, "response": res.json()}
+    except requests.exceptions.Timeout:
+        return {"error": "timeout"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def _safe_float(value, default=0.0):
     try:
         return float(value) if value else default
@@ -389,6 +411,20 @@ with col_btn:
         load_ledger.clear()
         st.rerun()
 
+# ─── [임시] OKX invitee-list 신규 엔드포인트 응답 확인 ───
+with st.expander("🧪 [임시] OKX 신규 엔드포인트 응답 확인"):
+    st.caption(
+        "OKX 기술팀이 언급한 /api/v5/affiliate/invitee/invitee-list 응답 확인용. "
+        "last 30 days 거래량이나 현재 잔고 필드가 있는지 검증 후 이 섹션은 지울 예정."
+    )
+    test_limit_v2 = st.number_input("응답 개수", min_value=1, max_value=20, value=3, key="test_v2")
+    if st.button("🧪 신규 엔드포인트 호출"):
+        for acc in accounts:
+            st.markdown(f"**계정 {acc['name']}**")
+            with st.spinner("호출 중..."):
+                result = call_invitee_list_v2(acc, limit=int(test_limit_v2))
+            st.json(result)
+
 # ─── 신규 멤버 추가 / 업그레이드 ───
 with st.expander("➕ 신규 멤버 추가하기 / 기존 멤버 업그레이드"):
     with st.form("add_member_form", clear_on_submit=True):
@@ -579,6 +615,71 @@ if st.session_state.get("last_results"):
     csv = df.to_csv(index=False).encode("utf-8-sig")
     st.download_button("결과 CSV 다운로드", data=csv,
                        file_name="volume_status.csv", mime="text/csv")
+
+    # ─── 미달자 일괄 제외 처리 ───
+    st.divider()
+    st.subheader("🚫 미달자 일괄 제외 처리")
+
+    excludable = [
+        r for r in results
+        if r["기준 달성"] == "미달"
+        and r["구분"] in ("트레이딩룸+지표", "트레이딩룸만")
+    ]
+
+    if not excludable:
+        st.info("이번 조회 결과 중 제외 처리 대상 미달자가 없어요. "
+                "(트레이딩룸 관련 회원 & 기준 미달인 사람만 표시)")
+    else:
+        st.write(f"기준 미달인 트레이딩룸 회원 **{len(excludable)}명** 발견")
+        preview_df = pd.DataFrame([
+            {"UID": r["UID"],
+             "닉네임": r["트뷰 닉네임"],
+             "구분": r["구분"],
+             f"{PERIOD_LABEL} 거래량": r[f"{PERIOD_LABEL} 거래량"]}
+            for r in excludable
+        ])
+        preview_df[f"{PERIOD_LABEL} 거래량"] = preview_df[f"{PERIOD_LABEL} 거래량"].apply(
+            lambda v: f"${v:,.0f}" if v is not None else "-"
+        )
+        st.dataframe(preview_df, use_container_width=True, hide_index=True)
+
+        selected_excl = st.multiselect(
+            "제외 처리할 UID 선택 (기본값: 전체)",
+            options=[r["UID"] for r in excludable],
+            default=[r["UID"] for r in excludable],
+            key="exclude_select",
+        )
+
+        st.caption(
+            "💡 구분을 '제외'로 바꾸고 H열(제외일)에 오늘 날짜를 자동 기록합니다. "
+            "D/E/F 열 옛날 값은 그대로 유지 (이탈 프로파일 분석용)."
+        )
+
+        if st.button(f"🚫 선택한 {len(selected_excl)}명 '제외' 처리",
+                     type="primary", key="exclude_btn"):
+            if not selected_excl:
+                st.warning("UID를 한 개 이상 선택하세요.")
+            else:
+                try:
+                    ws = get_worksheet()
+                    today = _today_str()
+                    edits = []
+                    for uid in selected_excl:
+                        lg = ledger.get(uid, {})
+                        col_updates = [(COL_GUBUN, "제외")]
+                        if not lg.get("제외일", "").strip():
+                            col_updates.append((COL_EXCLUDED, today))
+                        edits.append({"uid": uid, "col_updates": col_updates})
+
+                    cells, unfound = apply_edits_batch(ws, edits)
+                    load_ledger.clear()
+                    st.success(f"✅ {len(selected_excl)}명 '제외' 처리 완료")
+                    if unfound:
+                        st.warning(f"시트에 없는 UID: {', '.join(unfound)}")
+                    st.session_state.pop("last_results", None)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"처리 실패: {e}")
 
     # ─── 통합대장 편집 ───
     st.divider()
