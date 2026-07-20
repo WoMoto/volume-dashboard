@@ -126,9 +126,12 @@ def _signature(timestamp, method, path, secret):
     return base64.b64encode(mac.digest()).decode()
 
 
-def _check_uid(uid, account):
+def _check_uid(uid, account, periodType=None):
     timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
-    path = f"/api/v5/affiliate/invitee/detail?uid={uid}"
+    params = f"uid={uid}"
+    if periodType:
+        params += f"&periodType={periodType}"
+    path = f"/api/v5/affiliate/invitee/detail?{params}"
     sig = _signature(timestamp, "GET", path, account["secret_key"])
     headers = {
         "OK-ACCESS-KEY": account["api_key"],
@@ -188,9 +191,17 @@ def lookup_member(uid, accounts):
             data = result["data"][0]
             aff_code = data.get("affiliateCode", "")
             if aff_code in OUR_AFFILIATE_CODES:
+                # 최근 30일 거래량 별도 조회
+                result_30d = _check_uid(uid, account, periodType="last_30d")
+                last_30d_vol = None
+                if result_30d.get("code") == "0" and result_30d.get("data"):
+                    data_30d = result_30d["data"][0]
+                    last_30d_vol = _safe_float(data_30d.get("totalTradingVolume"))
+
                 return {
                     "found": True, "error": None,
                     "month_volume": _safe_float(data.get("volMonth")),
+                    "last_30d_volume": last_30d_vol,
                     "total_volume": _safe_float(data.get("totalTradingVolume")),
                     "total_commission": _safe_float(data.get("totalCommission")),
                     "deposit": _safe_float(data.get("depAmt")),
@@ -554,6 +565,7 @@ if st.button("조회", type="primary"):
                 passed = res["month_volume"] >= VOLUME_THRESHOLD
                 row.update({
                     f"{PERIOD_LABEL} 거래량": res["month_volume"],
+                    "최근 30일 거래량": res["last_30d_volume"],
                     "기준 달성": "달성" if passed else "미달",
                     "전체기간 거래량": res["total_volume"],
                     "전체기간 커미션": res["total_commission"],
@@ -561,7 +573,9 @@ if st.button("조회", type="primary"):
                 })
             else:
                 row.update({
-                    f"{PERIOD_LABEL} 거래량": None, "기준 달성": res["error"],
+                    f"{PERIOD_LABEL} 거래량": None,
+                    "최근 30일 거래량": None,
+                    "기준 달성": res["error"],
                     "전체기간 거래량": None, "전체기간 커미션": None, "누적 입금액": None,
                 })
             row.update({
@@ -604,7 +618,7 @@ if st.session_state.get("last_results"):
             )
             st.dataframe(miss, use_container_width=True, hide_index=True)
 
-    money_cols = [f"{PERIOD_LABEL} 거래량", "전체기간 거래량", "전체기간 커미션", "누적 입금액"]
+    money_cols = [f"{PERIOD_LABEL} 거래량", "최근 30일 거래량", "전체기간 거래량", "전체기간 커미션", "누적 입금액"]
     df_show = df.copy()
     for col in money_cols:
         df_show[col] = df_show[col].apply(lambda v: f"${v:,.0f}" if v is not None else "-")
