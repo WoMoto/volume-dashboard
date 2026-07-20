@@ -148,11 +148,11 @@ def _check_uid(uid, account):
 
 
 def call_invitee_list_v2(account, limit=3):
-    """[임시] OKX V2 엔드포인트 (invitee/invitee/list) 응답 확인용."""
+    """[임시] OKX invitee/list 엔드포인트에 periodType=last_30d 추가 테스트."""
     from urllib.parse import urlencode
     timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
-    query = urlencode({"limit": str(limit)})
-    path = f"/api/v5/affiliate/invitee/invitee/list?{query}"
+    query = urlencode({"limit": str(limit), "periodType": "last_30d"})
+    path = f"/api/v5/affiliate/invitee/list?{query}"
     sig = _signature(timestamp, "GET", path, account["secret_key"])
     headers = {
         "OK-ACCESS-KEY": account["api_key"],
@@ -414,8 +414,8 @@ with col_btn:
 # ─── [임시] OKX invitee-list 신규 엔드포인트 응답 확인 ───
 with st.expander("🧪 [임시] OKX 신규 엔드포인트 응답 확인"):
     st.caption(
-        "OKX 기술팀이 언급한 /api/v5/affiliate/invitee/invitee-list 응답 확인용. "
-        "last 30 days 거래량이나 현재 잔고 필드가 있는지 검증 후 이 섹션은 지울 예정."
+        "OKX invitee/list 엔드포인트에 periodType=last_30d 파라미터를 추가하여 호출. "
+        "응답의 totalVol이 '최근 30일 거래량'으로 나오는지 확인 후 이 섹션은 지울 예정."
     )
     test_limit_v2 = st.number_input("응답 개수", min_value=1, max_value=20, value=3, key="test_v2")
     if st.button("🧪 신규 엔드포인트 호출"):
