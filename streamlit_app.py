@@ -172,6 +172,26 @@ def call_invitee_list_v2(account, limit=3):
         return {"error": str(e)}
 
 
+def call_detail_periodtype(account, uid, periodType="last_30d"):
+    """[임시] /detail 엔드포인트 + periodType 조합 raw 응답 확인용."""
+    timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+    path = f"/api/v5/affiliate/invitee/detail?uid={uid}&periodType={periodType}"
+    sig = _signature(timestamp, "GET", path, account["secret_key"])
+    headers = {
+        "OK-ACCESS-KEY": account["api_key"],
+        "OK-ACCESS-SIGN": sig,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": account["passphrase"],
+    }
+    try:
+        res = requests.get(OKX_API_BASE + path, headers=headers, timeout=15)
+        return {"http_status": res.status_code, "path": path, "response": res.json()}
+    except requests.exceptions.Timeout:
+        return {"error": "timeout"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def _safe_float(value, default=0.0):
     try:
         return float(value) if value else default
@@ -435,6 +455,20 @@ with st.expander("🧪 [임시] OKX 신규 엔드포인트 응답 확인"):
             with st.spinner("호출 중..."):
                 result = call_invitee_list_v2(acc, limit=int(test_limit_v2))
             st.json(result)
+
+    st.divider()
+    st.markdown("**🧪 특정 UID로 /detail 엔드포인트 raw 응답 확인 (periodType=last_30d)**")
+    st.caption("이 UID의 응답 필드 전체를 있는 그대로 보여줍니다. 어떤 필드에 last 30일 값이 들어있는지 확인용.")
+    test_uid = st.text_input("UID 입력", key="test_uid_input")
+    if st.button("🧪 detail 호출"):
+        if not test_uid.strip():
+            st.warning("UID를 입력하세요.")
+        else:
+            for acc in accounts:
+                st.markdown(f"**계정 {acc['name']}**")
+                with st.spinner("호출 중..."):
+                    result = call_detail_periodtype(acc, test_uid.strip(), periodType="last_30d")
+                st.json(result)
 
 # ─── 신규 멤버 추가 / 업그레이드 ───
 with st.expander("➕ 신규 멤버 추가하기 / 기존 멤버 업그레이드"):
