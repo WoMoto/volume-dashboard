@@ -152,7 +152,7 @@ def call_invitee_list_v2(account, limit=3):
     from urllib.parse import urlencode
     timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
     query = urlencode({"limit": str(limit)})
-    path = f"/api/v5/affiliate/invitee/invitee-list?{query}"
+    path = f"/api/v5/affiliate/invitee/invitee/list?{query}"
     sig = _signature(timestamp, "GET", path, account["secret_key"])
     headers = {
         "OK-ACCESS-KEY": account["api_key"],
