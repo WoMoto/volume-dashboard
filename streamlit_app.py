@@ -148,7 +148,7 @@ def _check_uid(uid, account):
 
 
 def call_invitee_list_v2(account, limit=3):
-    """[임시] OKX 기술팀이 언급한 새 엔드포인트 응답 확인용."""
+    """[임시] OKX V2 엔드포인트 (invitee/invitee/list) 응답 확인용."""
     from urllib.parse import urlencode
     timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
     query = urlencode({"limit": str(limit)})
