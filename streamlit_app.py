@@ -38,10 +38,13 @@ COL_IND_DATE = 6   # F
 COL_CONFIRMED = 7  # G
 COL_EXCLUDED = 8   # H
 COL_MEMO = 9       # I
+COL_LAST_30D_VOL = 10       # J
+COL_LAST_30D_UPDATED = 11   # K
 
 LEDGER_COLS = [
     "트뷰 닉네임", "구분", "트레이딩룸 입장일", "입장시드",
     "지표 지급날짜", "실제 입장확인", "제외일", "메모",
+    "최근 30일 거래량", "갱신일시",
 ]
 GUBUN_OPTIONS = ["트레이딩룸+지표", "트레이딩룸만", "지표만", "제외"]
 
@@ -126,12 +129,9 @@ def _signature(timestamp, method, path, secret):
     return base64.b64encode(mac.digest()).decode()
 
 
-def _check_uid(uid, account, periodType=None):
+def _check_uid(uid, account):
     timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
-    params = f"uid={uid}"
-    if periodType:
-        params += f"&periodType={periodType}"
-    path = f"/api/v5/affiliate/invitee/detail?{params}"
+    path = f"/api/v5/affiliate/invitee/detail?uid={uid}"
     sig = _signature(timestamp, "GET", path, account["secret_key"])
     headers = {
         "OK-ACCESS-KEY": account["api_key"],
@@ -150,8 +150,8 @@ def _check_uid(uid, account, periodType=None):
         return {"code": "error", "msg": f"응답 파싱 실패: {e}"}
 
 
-def call_invitee_list_v2(account, limit=3, page=1):
-    """[임시] OKX invitee/list 엔드포인트에 periodType=last_30d 추가 테스트."""
+def call_invitee_list_page(account, page=1, limit=100):
+    """/list 엔드포인트 한 페이지 뽑기 (last_30d 기준)."""
     from urllib.parse import urlencode
     timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
     query = urlencode({
@@ -169,31 +169,11 @@ def call_invitee_list_v2(account, limit=3, page=1):
     }
     try:
         res = requests.get(OKX_API_BASE + path, headers=headers, timeout=15)
-        return {"http_status": res.status_code, "response": res.json()}
+        return res.json()
     except requests.exceptions.Timeout:
-        return {"error": "timeout"}
+        return {"code": "error", "msg": "timeout"}
     except Exception as e:
-        return {"error": str(e)}
-
-
-def call_detail_periodtype(account, uid, periodType="last_30d"):
-    """[임시] /detail 엔드포인트 + periodType 조합 raw 응답 확인용."""
-    timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
-    path = f"/api/v5/affiliate/invitee/detail?uid={uid}&periodType={periodType}"
-    sig = _signature(timestamp, "GET", path, account["secret_key"])
-    headers = {
-        "OK-ACCESS-KEY": account["api_key"],
-        "OK-ACCESS-SIGN": sig,
-        "OK-ACCESS-TIMESTAMP": timestamp,
-        "OK-ACCESS-PASSPHRASE": account["passphrase"],
-    }
-    try:
-        res = requests.get(OKX_API_BASE + path, headers=headers, timeout=15)
-        return {"http_status": res.status_code, "path": path, "response": res.json()}
-    except requests.exceptions.Timeout:
-        return {"error": "timeout"}
-    except Exception as e:
-        return {"error": str(e)}
+        return {"code": "error", "msg": str(e)}
 
 
 def _safe_float(value, default=0.0):
@@ -215,17 +195,9 @@ def lookup_member(uid, accounts):
             data = result["data"][0]
             aff_code = data.get("affiliateCode", "")
             if aff_code in OUR_AFFILIATE_CODES:
-                # 최근 30일 거래량 별도 조회
-                result_30d = _check_uid(uid, account, periodType="last_30d")
-                last_30d_vol = None
-                if result_30d.get("code") == "0" and result_30d.get("data"):
-                    data_30d = result_30d["data"][0]
-                    last_30d_vol = _safe_float(data_30d.get("totalTradingVolume"))
-
                 return {
                     "found": True, "error": None,
                     "month_volume": _safe_float(data.get("volMonth")),
-                    "last_30d_volume": last_30d_vol,
                     "total_volume": _safe_float(data.get("totalTradingVolume")),
                     "total_commission": _safe_float(data.get("totalCommission")),
                     "deposit": _safe_float(data.get("depAmt")),
@@ -417,6 +389,116 @@ def scan_duplicates(ws):
     ]
 
 
+def _save_last_30d_chunk(ws, matched_map, uid_to_row, now_str):
+    """매칭된 UID들의 최근 30일 거래량·갱신일시 배치 저장."""
+    updates = []
+    for uid, vol in matched_map.items():
+        row = uid_to_row.get(uid)
+        if row is None:
+            continue
+        vol_cell = gspread.utils.rowcol_to_a1(row, COL_LAST_30D_VOL)
+        upd_cell = gspread.utils.rowcol_to_a1(row, COL_LAST_30D_UPDATED)
+        updates.append({"range": vol_cell, "values": [[f"{vol:.2f}"]]})
+        updates.append({"range": upd_cell, "values": [[now_str]]})
+    if updates:
+        ws.batch_update(updates)
+
+
+def scan_last_30d_volumes(accounts, target_uids, ws, chunk_pages=100,
+                          progress_bar=None, status_area=None):
+    """
+    전체 회원 스캔 후 target_uids 매칭 → 시트 J/K열 저장.
+    페이지 청크마다 즉시 저장 (안전장치).
+    """
+    import time as _time
+    now_str = datetime.now(KST).strftime("%Y. %m. %d %H:%M")
+    uid_to_row = build_uid_row_map(ws)
+
+    # 각 계정별 총 페이지 수 파악 (page=1 호출)
+    account_pages = []
+    for acc in accounts:
+        first = call_invitee_list_page(acc, page=1, limit=100)
+        if first.get("code") != "0":
+            if status_area:
+                status_area.warning(
+                    f"{acc['name']} 첫 페이지 호출 실패: {first.get('msg')}"
+                )
+            account_pages.append((acc, 0, None))
+            continue
+        total = int(first.get("totalPage", 1))
+        account_pages.append((acc, total, first))
+
+    total_pages_all = sum(p for _, p, _ in account_pages)
+    if total_pages_all == 0:
+        return {"matched": 0, "pages_done": 0, "failed_pages": []}
+
+    matched_map = {}      # uid -> volume (최신값 유지)
+    pending = {}          # 저장 대기 (청크 저장용)
+    failed_pages = []
+    pages_done = 0
+    start = _time.time()
+
+    for acc, total, first in account_pages:
+        if total == 0:
+            continue
+
+        # 첫 페이지 처리 (이미 받아둔 응답)
+        pages_to_iter = [(1, first)]
+        for page in range(2, total + 1):
+            pages_to_iter.append((page, None))
+
+        for page_num, cached_resp in pages_to_iter:
+            resp = cached_resp if cached_resp is not None else \
+                call_invitee_list_page(acc, page=page_num, limit=100)
+
+            if resp.get("code") == "0":
+                for r in resp.get("data", []):
+                    uid = str(r.get("uid", "")).strip()
+                    if uid in target_uids:
+                        vol = _safe_float(r.get("totalVol"))
+                        matched_map[uid] = vol
+                        pending[uid] = vol
+            else:
+                failed_pages.append((acc["name"], page_num))
+
+            pages_done += 1
+
+            # 진행률 갱신 (매 5페이지)
+            if pages_done % 5 == 0 or pages_done == total_pages_all:
+                pct = pages_done / total_pages_all
+                elapsed = _time.time() - start
+                eta = (elapsed / pct - elapsed) if pct > 0 else 0
+                msg = (f"📡 {acc['name']} · 페이지 {pages_done}/{total_pages_all} "
+                       f"· 매칭 {len(matched_map)}명 "
+                       f"· 경과 {int(elapsed)}초 · 남음 약 {int(eta)}초")
+                if progress_bar is not None:
+                    progress_bar.progress(pct, text=msg)
+                if status_area is not None:
+                    status_area.markdown(msg)
+
+            # 청크 단위로 시트 저장
+            if pages_done % chunk_pages == 0 and pending:
+                try:
+                    _save_last_30d_chunk(ws, pending, uid_to_row, now_str)
+                    pending = {}
+                except Exception as e:
+                    if status_area:
+                        status_area.warning(f"중간 저장 실패 (재시도 예정): {e}")
+
+            _time.sleep(0.05)  # rate limit 완화
+
+    # 남은 것 저장
+    if pending:
+        _save_last_30d_chunk(ws, pending, uid_to_row, now_str)
+
+    return {
+        "matched": len(matched_map),
+        "pages_done": pages_done,
+        "failed_pages": failed_pages,
+        "updated_at": now_str,
+    }
+
+
 # ═══════════════════════════════════════════
 # 메인
 # ═══════════════════════════════════════════
@@ -446,34 +528,64 @@ with col_btn:
         load_ledger.clear()
         st.rerun()
 
-# ─── [임시] OKX invitee-list 신규 엔드포인트 응답 확인 ───
-with st.expander("🧪 [임시] OKX 신규 엔드포인트 응답 확인"):
-    st.caption(
-        "OKX invitee/list 엔드포인트에 periodType=last_30d 파라미터를 추가하여 호출. "
-        "응답의 totalVol이 '최근 30일 거래량'으로 나오는지 확인 후 이 섹션은 지울 예정."
-    )
-    test_limit_v2 = st.number_input("응답 개수 (limit)", min_value=1, max_value=100, value=100, key="test_v2")
-    test_page_v2 = st.number_input("페이지 번호 (page)", min_value=1, value=1, key="test_page_v2")
-    if st.button("🧪 신규 엔드포인트 호출"):
-        for acc in accounts:
-            st.markdown(f"**계정 {acc['name']}**")
-            with st.spinner("호출 중..."):
-                result = call_invitee_list_v2(acc, limit=int(test_limit_v2), page=int(test_page_v2))
-            st.json(result)
+# ─── 📡 최근 30일 거래량 스캔 ───
+# 스캔 대상: 통합대장에서 트레이딩룸 관련 UID만 매칭
+_today_ymd = _today_str()
+scan_target_uids = {
+    uid for uid, info in ledger.items()
+    if info.get("구분") in ("트레이딩룸+지표", "트레이딩룸만")
+}
+_updated_dates = [
+    info.get("갱신일시", "").split(" ")[0]
+    for uid, info in ledger.items()
+    if uid in scan_target_uids and info.get("갱신일시", "").strip()
+]
+_scanned_today = sum(1 for d in _updated_dates if d == _today_ymd)
+_last_updates = sorted([d for d in _updated_dates if d], reverse=True)
+_last_scan = _last_updates[0] if _last_updates else "없음"
 
-    st.divider()
-    st.markdown("**🧪 특정 UID로 /detail 엔드포인트 raw 응답 확인 (periodType=last_30d)**")
-    st.caption("이 UID의 응답 필드 전체를 있는 그대로 보여줍니다. 어떤 필드에 last 30일 값이 들어있는지 확인용.")
-    test_uid = st.text_input("UID 입력", key="test_uid_input")
-    if st.button("🧪 detail 호출"):
-        if not test_uid.strip():
-            st.warning("UID를 입력하세요.")
+with st.expander(f"📡 최근 30일 거래량 스캔 — 마지막 갱신: {_last_scan} "
+                 f"(오늘 갱신 {_scanned_today}/{len(scan_target_uids)})"):
+    st.caption(
+        f"트레이딩룸 회원 **{len(scan_target_uids)}명**의 최근 30일 거래량을 "
+        f"OKX에서 전체 스캔해서 시트 J열/K열에 저장합니다. "
+        f"7~13분 정도 걸리며, 100페이지마다 시트에 즉시 저장되므로 중간에 끊겨도 그때까지 데이터는 남습니다. "
+        f"진행 중에는 이 창을 닫지 마세요."
+    )
+
+    if st.button("🔄 지금 스캔", type="primary", key="scan_btn"):
+        if not scan_target_uids:
+            st.warning("트레이딩룸 회원이 없어 스캔할 대상이 없어요.")
         else:
-            for acc in accounts:
-                st.markdown(f"**계정 {acc['name']}**")
-                with st.spinner("호출 중..."):
-                    result = call_detail_periodtype(acc, test_uid.strip(), periodType="last_30d")
-                st.json(result)
+            try:
+                ws = get_worksheet()
+                progress_bar = st.progress(0.0, text="준비 중...")
+                status_area = st.empty()
+
+                result = scan_last_30d_volumes(
+                    accounts, scan_target_uids, ws,
+                    chunk_pages=100,
+                    progress_bar=progress_bar,
+                    status_area=status_area,
+                )
+
+                progress_bar.progress(1.0, text="✅ 스캔 완료")
+                load_ledger.clear()
+                st.success(
+                    f"✅ 스캔 완료 · 매칭 {result['matched']}명 저장 · "
+                    f"페이지 {result['pages_done']}개 처리 · "
+                    f"실패 페이지 {len(result['failed_pages'])}개"
+                )
+                if result["failed_pages"]:
+                    st.warning(
+                        f"실패한 페이지: {result['failed_pages'][:20]}..."
+                        if len(result["failed_pages"]) > 20
+                        else f"실패한 페이지: {result['failed_pages']}"
+                    )
+                    st.caption("실패 페이지가 있으면 다시 스캔하면 이어서 채워집니다.")
+            except Exception as e:
+                st.error(f"스캔 실패: {e}")
+
 
 # ─── 신규 멤버 추가 / 업그레이드 ───
 with st.expander("➕ 신규 멤버 추가하기 / 기존 멤버 업그레이드"):
@@ -591,29 +703,55 @@ if st.button("조회", type="primary"):
         st.warning("UID를 한 개 이상 입력해 주세요.")
     else:
         results = []
+        today_ymd = _today_str()
         progress = st.progress(0, text="조회 중...")
         for i, uid in enumerate(uids):
             res = lookup_member(uid, accounts)
             lg = ledger.get(uid, {})
+
+            # 시트 J열의 최근 30일 거래량 (있으면), K열 갱신일시
+            sheet_30d_raw = lg.get("최근 30일 거래량", "").strip()
+            sheet_updated = lg.get("갱신일시", "").strip()
+            has_valid_30d = False
+            sheet_30d_val = None
+            if sheet_30d_raw:
+                try:
+                    sheet_30d_val = float(sheet_30d_raw)
+                    # 오늘 스캔한 값이면 판정에 사용
+                    if sheet_updated.startswith(today_ymd):
+                        has_valid_30d = True
+                except ValueError:
+                    pass
+
             row = {
                 "트뷰 닉네임": lg.get("트뷰 닉네임") or "-",
                 "UID": uid,
                 "구분": lg.get("구분") or "-",
             }
             if res["found"]:
-                passed = res["month_volume"] >= VOLUME_THRESHOLD
+                # 판정: 시트의 오늘자 last 30d 값 우선. 없으면 "스캔 필요"
+                if has_valid_30d:
+                    passed = sheet_30d_val >= VOLUME_THRESHOLD
+                    verdict = "달성" if passed else "미달"
+                elif lg.get("구분") in ("트레이딩룸+지표", "트레이딩룸만"):
+                    verdict = "스캔 필요"
+                else:
+                    verdict = "-"
+
                 row.update({
+                    "최근 30일 거래량": sheet_30d_val,
+                    "갱신일시": sheet_updated or "-",
                     f"{PERIOD_LABEL} 거래량": res["month_volume"],
-                    "최근 30일 거래량": res["last_30d_volume"],
-                    "기준 달성": "달성" if passed else "미달",
+                    "기준 달성": verdict,
                     "전체기간 거래량": res["total_volume"],
                     "전체기간 커미션": res["total_commission"],
                     "누적 입금액": res["deposit"],
                 })
             else:
                 row.update({
+                    "최근 30일 거래량": sheet_30d_val,
+                    "갱신일시": sheet_updated or "-",
                     f"{PERIOD_LABEL} 거래량": None,
-                    "최근 30일 거래량": None,
                     "기준 달성": res["error"],
                     "전체기간 거래량": None, "전체기간 커미션": None, "누적 입금액": None,
                 })
@@ -638,21 +776,27 @@ if st.session_state.get("last_results"):
     total = len(df)
     achieved = (df["기준 달성"] == "달성").sum()
     failed = (df["기준 달성"] == "미달").sum()
+    need_scan = (df["기준 달성"] == "스캔 필요").sum()
     in_ledger = (df["구분"] != "-").sum()
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("전체", f"{total}명")
     c2.metric("기준 달성", f"{achieved}명")
     c3.metric("기준 미달", f"{failed}명")
-    c4.metric("대장 매칭", f"{in_ledger}명")
+    c4.metric("스캔 필요", f"{need_scan}명")
+    c5.metric("대장 매칭", f"{in_ledger}명")
+
+    if need_scan > 0:
+        st.info(f"⚠️ {need_scan}명은 오늘 스캔된 최근 30일 거래량이 없어 판정 보류. "
+                f"상단 '📡 최근 30일 거래량 스캔'을 먼저 실행하세요.")
 
     if failed > 0:
         with st.expander(f"📋 미달자 UID 모아보기 ({failed}명)"):
             miss = df[df["기준 달성"] == "미달"][
-                ["트뷰 닉네임", "UID", f"{PERIOD_LABEL} 거래량", "트레이딩룸 입장일"]
+                ["트뷰 닉네임", "UID", "최근 30일 거래량", "트레이딩룸 입장일"]
             ].copy()
             st.code("\n".join(miss["UID"].tolist()), language=None)
-            miss[f"{PERIOD_LABEL} 거래량"] = miss[f"{PERIOD_LABEL} 거래량"].apply(
+            miss["최근 30일 거래량"] = miss["최근 30일 거래량"].apply(
                 lambda v: f"${v:,.0f}" if v is not None else "-"
             )
             st.dataframe(miss, use_container_width=True, hide_index=True)
@@ -688,10 +832,10 @@ if st.session_state.get("last_results"):
             {"UID": r["UID"],
              "닉네임": r["트뷰 닉네임"],
              "구분": r["구분"],
-             f"{PERIOD_LABEL} 거래량": r[f"{PERIOD_LABEL} 거래량"]}
+             "최근 30일 거래량": r["최근 30일 거래량"]}
             for r in excludable
         ])
-        preview_df[f"{PERIOD_LABEL} 거래량"] = preview_df[f"{PERIOD_LABEL} 거래량"].apply(
+        preview_df["최근 30일 거래량"] = preview_df["최근 30일 거래량"].apply(
             lambda v: f"${v:,.0f}" if v is not None else "-"
         )
         st.dataframe(preview_df, use_container_width=True, hide_index=True)
