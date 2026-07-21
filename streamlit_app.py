@@ -150,11 +150,15 @@ def _check_uid(uid, account, periodType=None):
         return {"code": "error", "msg": f"응답 파싱 실패: {e}"}
 
 
-def call_invitee_list_v2(account, limit=3):
+def call_invitee_list_v2(account, limit=3, page=1):
     """[임시] OKX invitee/list 엔드포인트에 periodType=last_30d 추가 테스트."""
     from urllib.parse import urlencode
     timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
-    query = urlencode({"limit": str(limit), "periodType": "last_30d"})
+    query = urlencode({
+        "limit": str(limit),
+        "page": str(page),
+        "periodType": "last_30d",
+    })
     path = f"/api/v5/affiliate/invitee/list?{query}"
     sig = _signature(timestamp, "GET", path, account["secret_key"])
     headers = {
@@ -448,12 +452,13 @@ with st.expander("🧪 [임시] OKX 신규 엔드포인트 응답 확인"):
         "OKX invitee/list 엔드포인트에 periodType=last_30d 파라미터를 추가하여 호출. "
         "응답의 totalVol이 '최근 30일 거래량'으로 나오는지 확인 후 이 섹션은 지울 예정."
     )
-    test_limit_v2 = st.number_input("응답 개수", min_value=1, max_value=20, value=3, key="test_v2")
+    test_limit_v2 = st.number_input("응답 개수 (limit)", min_value=1, max_value=100, value=100, key="test_v2")
+    test_page_v2 = st.number_input("페이지 번호 (page)", min_value=1, value=1, key="test_page_v2")
     if st.button("🧪 신규 엔드포인트 호출"):
         for acc in accounts:
             st.markdown(f"**계정 {acc['name']}**")
             with st.spinner("호출 중..."):
-                result = call_invitee_list_v2(acc, limit=int(test_limit_v2))
+                result = call_invitee_list_v2(acc, limit=int(test_limit_v2), page=int(test_page_v2))
             st.json(result)
 
     st.divider()
